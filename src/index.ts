@@ -40,6 +40,7 @@ interface StreamState {
 
 const CONFIG_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.json");
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".pi", "msg-bridge.json");
+const LOCK_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.lock");
 
 function loadConfig(): BridgeConfig {
   let config: BridgeConfig = {};
@@ -94,6 +95,71 @@ function saveConfig(config: BridgeConfig): void {
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   }
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+// ─── Lock File Management ────────────────────────────────────────────────────
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // Signal 0: just checks if process exists
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock(): boolean {
+  const myPid = process.pid;
+
+  // Check existing lock
+  if (fs.existsSync(LOCK_PATH)) {
+    try {
+      const content = fs.readFileSync(LOCK_PATH, "utf-8").trim();
+      const lockedPid = parseInt(content, 10);
+
+      if (!isNaN(lockedPid) && lockedPid !== myPid && isProcessAlive(lockedPid)) {
+        // Another live process holds the lock
+        return false;
+      }
+      // Stale lock (process dead) or same PID — take over
+    } catch {
+      // Corrupt lock file — take over
+    }
+  }
+
+  // Write our PID
+  const lockDir = path.dirname(LOCK_PATH);
+  if (!fs.existsSync(lockDir)) {
+    fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  }
+  fs.writeFileSync(LOCK_PATH, myPid.toString(), { mode: 0o600 });
+  return true;
+}
+
+function releaseLock(): void {
+  try {
+    if (!fs.existsSync(LOCK_PATH)) return;
+    const content = fs.readFileSync(LOCK_PATH, "utf-8").trim();
+    const lockedPid = parseInt(content, 10);
+    // Only remove if we own it
+    if (lockedPid === process.pid) {
+      fs.unlinkSync(LOCK_PATH);
+    }
+  } catch {
+    // Ignore errors during cleanup
+  }
+}
+
+function getLockOwner(): number | null {
+  try {
+    if (!fs.existsSync(LOCK_PATH)) return null;
+    const content = fs.readFileSync(LOCK_PATH, "utf-8").trim();
+    const pid = parseInt(content, 10);
+    if (!isNaN(pid) && isProcessAlive(pid)) return pid;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Markdown → HTML ─────────────────────────────────────────────────────────
@@ -207,6 +273,16 @@ export default function (pi: ExtensionAPI) {
     const token = config.telegram?.token;
     if (!token) {
       latestCtx?.ui.notify("❌ Telegram token not configured", "error");
+      return;
+    }
+
+    // Acquire lock to prevent multiple instances polling the same bot
+    if (!acquireLock()) {
+      const ownerPid = getLockOwner();
+      latestCtx?.ui.notify(
+        `⚠️ Telegram bot is already running in another pi instance (PID ${ownerPid}). Skipping connect.`,
+        "warning",
+      );
       return;
     }
 
@@ -425,9 +501,23 @@ export default function (pi: ExtensionAPI) {
 
     // ─── Error Handler ──────────────────────────────────────────────────
 
-    bot.catch((err) => {
+    bot.catch(async (err) => {
       const e = err.error;
       if (e instanceof GrammyError) {
+        if (e.error_code === 409) {
+          // Another instance took over polling — gracefully stop this one
+          latestCtx?.ui.notify(
+            "⚠️ Telegram bot conflict detected (another instance is polling). Disconnecting this instance.",
+            "warning",
+          );
+          // Stop without recursion: just clean up state
+          try { await bot?.stop(); } catch {}
+          bot = null;
+          isConnected = false;
+          releaseLock();
+          latestCtx?.ui.setStatus("tg", undefined);
+          return;
+        }
         console.error("Grammy error:", e.description);
       } else if (e instanceof HttpError) {
         console.error("HTTP error:", e);
@@ -463,6 +553,7 @@ export default function (pi: ExtensionAPI) {
     await bot.stop();
     bot = null;
     isConnected = false;
+    releaseLock();
     latestCtx?.ui.setStatus("tg", undefined);
     latestCtx?.ui.notify("📱 Telegram bot disconnected", "info");
   }
@@ -757,7 +848,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    await disconnectBot();
+    try {
+      await disconnectBot();
+    } finally {
+      releaseLock();
+    }
   });
 
   // ─── Pi Commands ──────────────────────────────────────────────────────
@@ -778,14 +873,21 @@ export default function (pi: ExtensionAPI) {
           await disconnectBot();
           break;
 
-        case "status":
+        case "status": {
+          const lockOwner = getLockOwner();
+          const lockInfo = lockOwner
+            ? lockOwner === process.pid
+              ? " | Lock: ✅ owned by this instance"
+              : ` | Lock: ⚠️ held by PID ${lockOwner}`
+            : " | Lock: none";
           ctx.ui.notify(
             isConnected
-              ? `📱 Telegram connected | Stream: ${config.telegram?.stream ? "ON" : "OFF"} | Trusted: ${config.auth?.trustedUsers?.length ?? 0} users`
-              : "📱 Telegram disconnected",
+              ? `📱 Telegram connected | Stream: ${config.telegram?.stream ? "ON" : "OFF"} | Trusted: ${config.auth?.trustedUsers?.length ?? 0} users${lockInfo}`
+              : `📱 Telegram disconnected${lockInfo}`,
             "info",
           );
           break;
+        }
 
         case "config":
           ctx.ui.notify(JSON.stringify(config, null, 2), "info");
