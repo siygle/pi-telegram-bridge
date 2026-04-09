@@ -100,6 +100,10 @@ Config is stored in `~/.pi/telegram-bridge.json`:
 4. Images from tool results (e.g., generated posters, screenshots) are automatically sent to Telegram
 5. Unauthorized users are rejected with their user ID displayed (for easy whitelisting)
 
+## Design Notes
+
+- Memory architecture plan: [`docs/memory-architecture-plan.md`](docs/memory-architecture-plan.md)
+
 ## Requirements
 
 - [pi coding agent](https://github.com/nickarino/pi-coding-agent) (v1.0+)
