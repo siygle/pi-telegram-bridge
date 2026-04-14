@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Bot, InlineKeyboard, InputFile, GrammyError, HttpError } from "grammy";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -41,6 +42,13 @@ interface StreamState {
 const CONFIG_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.json");
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".pi", "msg-bridge.json");
 const LOCK_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.lock");
+const MEMORY_SCRIPT_PATH = path.join(os.homedir(), ".pi", "agent", "skills", "memory", "scripts", "memory.sh");
+const MEMORY_PROMPT_HEADER = [
+  "[Persistent user memory loaded at session start]",
+  "Use this memory as background context and preference guidance.",
+  "Prefer it when it helps personalize or disambiguate replies, but do not mention memory unless relevant.",
+  "",
+].join("\n");
 
 function loadConfig(): BridgeConfig {
   let config: BridgeConfig = {};
@@ -95,6 +103,23 @@ function saveConfig(config: BridgeConfig): void {
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   }
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+function loadMemoryDump(): string | null {
+  if (!fs.existsSync(MEMORY_SCRIPT_PATH)) return null;
+
+  try {
+    const output = execFileSync("bash", [MEMORY_SCRIPT_PATH, "dump"], {
+      encoding: "utf-8",
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    }).trim();
+
+    return output || null;
+  } catch (error) {
+    console.error("Failed to load persistent memory:", error);
+    return null;
+  }
 }
 
 // ─── Lock File Management ────────────────────────────────────────────────────
@@ -264,6 +289,7 @@ export default function (pi: ExtensionAPI) {
   let pendingChat: PendingChat | null = null;
   let streamState: StreamState | null = null;
   let isConnected = false;
+  let memoryDump: string | null = null;
 
   // ─── Bot Management ──────────────────────────────────────────────────────
 
@@ -435,6 +461,9 @@ export default function (pi: ExtensionAPI) {
         content = reply.caption;
       } else if (reply.photo) {
         content = "[image]";
+      } else if ((reply as any).document) {
+        const doc = (reply as any).document;
+        content = `[file: ${doc.file_name || "unnamed"}]`;
       } else {
         return null;
       }
@@ -479,6 +508,70 @@ export default function (pi: ExtensionAPI) {
           { type: "image" as const, mimeType: "image/jpeg" as const, data: base64 },
         ],
       );
+    });
+
+    // ─── Document / File Messages ───────────────────────────────────────
+
+    bot.on("message:document", async (ctx) => {
+      const doc = ctx.message.document;
+      if (!doc) return;
+
+      const file = await ctx.api.getFile(doc.file_id);
+      if (!file.file_path) {
+        await ctx.reply("❌ Could not download file.");
+        return;
+      }
+
+      // Download file to temp directory
+      const url = `https://api.telegram.org/file/bot${config.telegram!.token}/${file.file_path}`;
+      const response = await fetch(url);
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      // Save with original filename, prefixed to avoid collisions
+      const sanitizedName = (doc.file_name || "unnamed").replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, "_");
+      const timestamp = Date.now();
+      const uploadDir = path.join(os.tmpdir(), "pi-telegram-uploads");
+      if (!fs.existsSync(uploadDir)) {
+        fs.mkdirSync(uploadDir, { recursive: true });
+      }
+      const filePath = path.join(uploadDir, `${timestamp}-${sanitizedName}`);
+      fs.writeFileSync(filePath, buffer);
+
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
+      const caption = ctx.message.caption || "";
+      const fileSize = doc.file_size ? `${(doc.file_size / 1024).toFixed(1)}KB` : "unknown size";
+
+      // Check if it's an image type that wasn't sent as photo (e.g., sent as file)
+      const mimeType = doc.mime_type || "";
+      const isImage = mimeType.startsWith("image/");
+
+      const replyContext = await extractReplyContext(ctx);
+
+      if (isImage) {
+        // Send as image so LLM can see it
+        const base64 = buffer.toString("base64");
+        const imgMime = (mimeType || "image/png") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+
+        const textParts = [
+          replyContext,
+          `[📱 @${username} via telegram][📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+        ].filter(Boolean).join("\n\n");
+
+        setPendingChat(ctx);
+        forwardToPi([
+          { type: "text" as const, text: textParts },
+          { type: "image" as const, mimeType: imgMime, data: base64 },
+        ]);
+      } else {
+        // Non-image file: send as text with file path
+        const textParts = [
+          replyContext,
+          `[📱 @${username} via telegram][📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+        ].filter(Boolean).join("\n\n");
+
+        setPendingChat(ctx);
+        forwardToPi(textParts);
+      }
     });
 
     // ─── Text Messages ──────────────────────────────────────────────────
@@ -733,10 +826,23 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
     config = loadConfig();
+    memoryDump = loadMemoryDump();
+
+    if (!memoryDump) {
+      ctx.ui.notify("⚠️ Persistent memory not loaded", "warning");
+    }
 
     if (config.autoConnect && config.telegram?.token) {
       await connectBot();
     }
+  });
+
+  pi.on("before_agent_start", async (event, _ctx) => {
+    if (!memoryDump) return;
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${MEMORY_PROMPT_HEADER}${memoryDump}`,
+    };
   });
 
   pi.on("turn_start", async (_event, ctx) => {
