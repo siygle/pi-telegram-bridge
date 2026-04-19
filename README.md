@@ -6,6 +6,7 @@ A [pi coding agent](https://github.com/nickarino/pi-coding-agent) extension that
 
 - 💬 **Two-way messaging** — Send messages from Telegram, get responses back
 - 🖼️ **Image support** — Send photos for vision/analysis
+- 🎙️ **Voice / audio / video_note support** — Auto-transcribed via Groq Whisper (free tier) or OpenAI
 - 📡 **Streaming mode** — Watch responses appear in real-time (optional)
 - 🔐 **Auth control** — Whitelist trusted Telegram users by ID
 - 🤖 **Model switching** — Change models on the fly via `/model`
@@ -55,7 +56,13 @@ Config is stored in `~/.pi/telegram-bridge.json`:
   "auth": {
     "trustedUsers": ["telegram:123456789"]
   },
-  "autoConnect": true
+  "autoConnect": true,
+  "stt": {
+    "provider": "groq",
+    "apiKey": "gsk_...",
+    "model": "whisper-large-v3-turbo",
+    "language": "zh"
+  }
 }
 ```
 
@@ -66,6 +73,30 @@ Config is stored in `~/.pi/telegram-bridge.json`:
 | `telegram.streamThrottleMs` | `PI_TELEGRAM_STREAM_THROTTLE` | Minimum ms between stream edits (default: 1500) |
 | `auth.trustedUsers` | `PI_TELEGRAM_TRUSTED_USERS` | Comma-separated Telegram user IDs |
 | `autoConnect` | `PI_TELEGRAM_AUTO_CONNECT` | Auto-connect on pi startup |
+| `stt.provider` | `PI_TELEGRAM_STT_PROVIDER` | `groq` (default), `openai`, or `none` |
+| `stt.apiKey` | `PI_TELEGRAM_STT_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` | API key for the STT provider |
+| `stt.model` | `PI_TELEGRAM_STT_MODEL` | Default: `whisper-large-v3-turbo` (Groq) / `whisper-1` (OpenAI) |
+| `stt.language` | `PI_TELEGRAM_STT_LANGUAGE` | Optional ISO-639-1 hint (e.g. `zh`, `en`) |
+| `stt.baseUrl` | — | Override API base URL (for self-hosted/compatible endpoints) |
+
+### Voice transcription
+
+Send a voice message, audio file, or video_note in Telegram and the bridge will:
+
+1. Download the file to `/tmp/pi-telegram-uploads/`
+2. Transcribe via the configured STT provider (Groq by default)
+3. Forward the transcript + file path to pi as:
+   `[📱 @user via telegram][🎙️ voice, 12s, 48.3KB, file: /tmp/...]: <transcript>`
+
+If STT is not configured, the file path is still forwarded so you can transcribe manually.
+
+**Quick setup with Groq (free tier):**
+
+```bash
+export GROQ_API_KEY="gsk_..."   # get from https://console.groq.com/keys
+```
+
+The bridge auto-detects `GROQ_API_KEY` and defaults the provider to `groq` with `whisper-large-v3-turbo`. Free tier covers ~8h of audio/day — plenty for personal use.
 
 ## Commands
 
