@@ -17,10 +17,19 @@ interface AuthConfig {
   trustedUsers?: string[];
 }
 
+interface STTConfig {
+  provider?: "groq" | "openai" | "none";
+  apiKey?: string;
+  model?: string;
+  baseUrl?: string;
+  language?: string;
+}
+
 interface BridgeConfig {
   telegram?: TelegramConfig;
   auth?: AuthConfig;
   autoConnect?: boolean;
+  stt?: STTConfig;
 }
 
 interface PendingChat {
@@ -94,7 +103,67 @@ function loadConfig(): BridgeConfig {
     config.autoConnect = process.env.PI_TELEGRAM_AUTO_CONNECT === "true";
   }
 
+  // STT env overrides (GROQ_API_KEY is a common convention)
+  const sttProvider = process.env.PI_TELEGRAM_STT_PROVIDER as STTConfig["provider"] | undefined;
+  const sttKey =
+    process.env.PI_TELEGRAM_STT_API_KEY ||
+    (sttProvider === "openai" ? process.env.OPENAI_API_KEY : process.env.GROQ_API_KEY);
+  if (sttProvider || sttKey || process.env.PI_TELEGRAM_STT_MODEL || process.env.PI_TELEGRAM_STT_LANGUAGE) {
+    config.stt = {
+      ...config.stt,
+      ...(sttProvider ? { provider: sttProvider } : {}),
+      ...(sttKey ? { apiKey: sttKey } : {}),
+      ...(process.env.PI_TELEGRAM_STT_MODEL ? { model: process.env.PI_TELEGRAM_STT_MODEL } : {}),
+      ...(process.env.PI_TELEGRAM_STT_LANGUAGE ? { language: process.env.PI_TELEGRAM_STT_LANGUAGE } : {}),
+    };
+  }
+  // Default provider to groq if an apiKey is configured but provider is unset
+  if (config.stt?.apiKey && !config.stt.provider) {
+    config.stt.provider = "groq";
+  }
+
   return config;
+}
+
+// ─── STT (Speech-to-Text) ────────────────────────────────────────────────────
+
+async function transcribeAudio(
+  stt: STTConfig | undefined,
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+): Promise<{ text: string; error?: string }> {
+  if (!stt || stt.provider === "none" || !stt.apiKey) {
+    return { text: "", error: "STT not configured" };
+  }
+
+  const provider = stt.provider || "groq";
+  const baseUrl =
+    stt.baseUrl ||
+    (provider === "openai" ? "https://api.openai.com/v1" : "https://api.groq.com/openai/v1");
+  const model = stt.model || (provider === "openai" ? "whisper-1" : "whisper-large-v3-turbo");
+
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+  form.append("model", model);
+  form.append("response_format", "json");
+  if (stt.language) form.append("language", stt.language);
+
+  try {
+    const res = await fetch(`${baseUrl}/audio/transcriptions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${stt.apiKey}` },
+      body: form,
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      return { text: "", error: `HTTP ${res.status}: ${errText.slice(0, 200)}` };
+    }
+    const data = (await res.json()) as { text?: string };
+    return { text: (data.text || "").trim() };
+  } catch (e: any) {
+    return { text: "", error: e?.message || String(e) };
+  }
 }
 
 function saveConfig(config: BridgeConfig): void {
@@ -464,6 +533,12 @@ export default function (pi: ExtensionAPI) {
       } else if ((reply as any).document) {
         const doc = (reply as any).document;
         content = `[file: ${doc.file_name || "unnamed"}]`;
+      } else if ((reply as any).voice) {
+        content = `[voice, ${(reply as any).voice.duration || 0}s]`;
+      } else if ((reply as any).audio) {
+        content = `[audio: ${(reply as any).audio.file_name || "unnamed"}]`;
+      } else if ((reply as any).video_note) {
+        content = `[video_note, ${(reply as any).video_note.duration || 0}s]`;
       } else {
         return null;
       }
@@ -572,6 +647,83 @@ export default function (pi: ExtensionAPI) {
         setPendingChat(ctx);
         forwardToPi(textParts);
       }
+    });
+
+    // ─── Voice / Audio / Video Note Messages ───────────────────────────
+
+    async function handleAudioMessage(
+      ctx: any,
+      media: { file_id: string; mime_type?: string; duration?: number; file_name?: string; file_size?: number },
+      kind: "voice" | "audio" | "video_note",
+    ): Promise<void> {
+      const file = await ctx.api.getFile(media.file_id);
+      if (!file.file_path) {
+        await ctx.reply(`❌ Could not download ${kind}.`);
+        return;
+      }
+
+      const url = `https://api.telegram.org/file/bot${config.telegram!.token}/${file.file_path}`;
+      const response = await fetch(url);
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      const uploadDir = path.join(os.tmpdir(), "pi-telegram-uploads");
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+      const srcExt = path.extname(file.file_path) || path.extname(media.file_name || "");
+      const ext = srcExt || (kind === "voice" ? ".ogg" : kind === "video_note" ? ".mp4" : ".mp3");
+      const baseName = media.file_name
+        ? media.file_name.replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, "_")
+        : `${kind}${ext}`;
+      const filePath = path.join(uploadDir, `${Date.now()}-${baseName}`);
+      fs.writeFileSync(filePath, buffer);
+
+      const mime =
+        media.mime_type ||
+        (kind === "voice" ? "audio/ogg" : kind === "video_note" ? "video/mp4" : "audio/mpeg");
+      const duration = media.duration || 0;
+      const sizeStr = media.file_size ? `${(media.file_size / 1024).toFixed(1)}KB` : "unknown";
+
+      // Transcribe via STT (Groq by default)
+      const stt = config.stt;
+      const sttEnabled = stt && stt.provider !== "none" && !!stt.apiKey;
+      let transcript = "";
+      let sttError: string | undefined;
+      if (sttEnabled) {
+        const result = await transcribeAudio(stt, buffer, path.basename(filePath), mime);
+        transcript = result.text;
+        sttError = result.error;
+      }
+
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
+      const caption = (ctx.message as any).caption || "";
+      const replyContext = await extractReplyContext(ctx);
+
+      const header = `[📱 @${username} via telegram][🎙️ ${kind}, ${duration}s, ${sizeStr}, file: ${filePath}]`;
+      let body: string;
+      if (transcript) {
+        body = `${header}: ${transcript}`;
+      } else if (sttError) {
+        body = `${header} (transcription failed: ${sttError} — audio file saved, you may invoke STT manually)`;
+      } else {
+        body = `${header} (STT not configured — audio file saved, transcription skipped)`;
+      }
+      if (caption) body = `${body}\n\n[caption]: ${caption}`;
+
+      const textParts = replyContext ? `${replyContext}\n\n${body}` : body;
+      setPendingChat(ctx);
+      forwardToPi(textParts);
+    }
+
+    bot.on("message:voice", async (ctx) => {
+      await handleAudioMessage(ctx, ctx.message.voice, "voice");
+    });
+
+    bot.on("message:audio", async (ctx) => {
+      await handleAudioMessage(ctx, ctx.message.audio, "audio");
+    });
+
+    bot.on("message:video_note", async (ctx) => {
+      await handleAudioMessage(ctx, ctx.message.video_note, "video_note");
     });
 
     // ─── Text Messages ──────────────────────────────────────────────────
