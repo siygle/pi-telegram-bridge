@@ -52,6 +52,7 @@ const CONFIG_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.json");
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".pi", "msg-bridge.json");
 const LOCK_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.lock");
 const MEMORY_SCRIPT_PATH = path.join(os.homedir(), ".pi", "agent", "skills", "memory", "scripts", "memory.sh");
+const STOCKNEWS_SCRIPT_PATH = path.join(os.homedir(), ".pi", "agent", "extensions", "stock-news-tracker", "scripts", "stocknews.py");
 const MEMORY_PROMPT_HEADER = [
   "[Persistent user memory loaded at session start]",
   "Use this memory as background context and preference guidance.",
@@ -408,6 +409,7 @@ export default function (pi: ExtensionAPI) {
           "/status — Show bot & agent status",
           "/model — Switch model (or /model &lt;name&gt;)",
           "/compact — Compact conversation",
+          "/stocknews — Stock news tracker (add/remove/stop/list/news/digest)",
           "/help — Show this help",
         ].join("\n"),
         { parse_mode: "HTML" },
@@ -500,6 +502,36 @@ export default function (pi: ExtensionAPI) {
         onError: (err) => sendTelegram(ctx.chat.id.toString(), "❌ Compaction failed: " + err.message),
       });
       await ctx.reply("📦 Compacting conversation...");
+    });
+
+    bot.command("stocknews", async (ctx) => {
+      const args = ctx.match?.trim() || "";
+      if (!args) {
+        await ctx.reply([
+          "📈 <b>Stock News Tracker</b>",
+          "",
+          "<code>/stocknews add 6239</code>",
+          "<code>/stocknews add COHU:NASDAQ</code>",
+          "<code>/stocknews remove 6239</code> — 移除追蹤",
+          "<code>/stocknews stop 6239</code> — 暫停追蹤",
+          "<code>/stocknews list</code>",
+          "<code>/stocknews news 6239</code>",
+          "<code>/stocknews digest --all</code>",
+        ].join("\n"), { parse_mode: "HTML" });
+        return;
+      }
+      try {
+        const parts = args.split(/\s+/).filter(Boolean);
+        const output = execFileSync("python3", [STOCKNEWS_SCRIPT_PATH, ...parts], {
+          encoding: "utf-8",
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        }).trim();
+        await ctx.reply((output || "OK").slice(0, 3900), { disable_web_page_preview: true });
+      } catch (err: any) {
+        const msg = err?.stderr?.toString?.() || err?.stdout?.toString?.() || err?.message || String(err);
+        await ctx.reply("❌ stocknews failed:\n" + msg.slice(0, 3500));
+      }
     });
 
     // ─── Callback Queries (InlineKeyboard) ──────────────────────────────
