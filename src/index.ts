@@ -263,35 +263,65 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function escapeHtmlAttr(text: string): string {
+  return escapeHtml(text).replace(/"/g, "&quot;");
+}
+
+function isSafeUrl(url: string): boolean {
+  return /^(https?:\/\/|tg:\/\/|mailto:)/i.test(url);
+}
+
+function placeholder(prefix: string, index: number): string {
+  return `§§${prefix}_${index}§§`;
+}
+
 function markdownToHtml(md: string): string {
-  // Protect code blocks
-  const codeBlocks: string[] = [];
-  let result = md.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, _lang, code) => {
-    codeBlocks.push(`<pre>${escapeHtml(code.trimEnd())}</pre>`);
-    return `__CODEBLOCK_${codeBlocks.length - 1}__`;
+  const blocks: string[] = [];
+  const inlines: string[] = [];
+
+  // Telegram Bot API rich HTML supports <pre><code class="language-*"> for expandable code rendering in clients.
+  let result = md.replace(/```([\w#+.-]*)\n?([\s\S]*?)```/g, (_match, lang, code) => {
+    const languageClass = lang ? ` class="language-${escapeHtmlAttr(String(lang))}"` : "";
+    blocks.push(`<pre><code${languageClass}>${escapeHtml(String(code).trimEnd())}</code></pre>`);
+    return placeholder("CODEBLOCK", blocks.length - 1);
   });
 
-  // Protect inline code
-  const inlineCodes: string[] = [];
+  // Protect inline code before applying emphasis/link transforms.
   result = result.replace(/`([^`]+)`/g, (_match, code) => {
-    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
-    return `__INLINE_${inlineCodes.length - 1}__`;
+    inlines.push(`<code>${escapeHtml(String(code))}</code>`);
+    return placeholder("INLINE", inlines.length - 1);
   });
 
-  // Escape HTML in remaining text
   result = escapeHtml(result);
 
-  // Convert markdown formatting
-  result = result.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-  result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
-  result = result.replace(/~~(.+?)~~/g, "<s>$1</s>");
+  // Headings become bold section titles; h1/h2 get visual spacing suitable for Telegram posts.
+  result = result.replace(/^#{1,2}\s+(.+)$/gm, "<b>$1</b>");
+  result = result.replace(/^#{3,6}\s+(.+)$/gm, "<b>$1</b>");
 
-  // Convert headers to bold
-  result = result.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+  // Markdown links -> Telegram-supported HTML links.
+  result = result.replace(/\[([^\]\n]+)]\((https?:\/\/[^\s)]+|tg:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, (_m, label, url) => {
+    const href = String(url);
+    return isSafeUrl(href) ? `<a href="${escapeHtmlAttr(href)}">${label}</a>` : String(label);
+  });
 
-  // Restore code blocks and inline code
-  result = result.replace(/__CODEBLOCK_(\d+)__/g, (_, idx) => codeBlocks[parseInt(idx)]);
-  result = result.replace(/__INLINE_(\d+)__/g, (_, idx) => inlineCodes[parseInt(idx)]);
+  // Telegram rich formatting options.
+  result = result.replace(/\*\*([^\n*][\s\S]*?[^\n*])\*\*/g, "<b>$1</b>");
+  result = result.replace(/(?<!\*)\*(?!\*)([^\n*][^\n]*?[^\n*])(?<!\*)\*(?!\*)/g, "<i>$1</i>");
+  result = result.replace(/__([^\n_][^\n]*?[^\n_])__/g, "<u>$1</u>");
+  result = result.replace(/~~([^\n~][\s\S]*?[^\n~])~~/g, "<s>$1</s>");
+  result = result.replace(/\|\|([^\n|][\s\S]*?[^\n|])\|\|/g, "<tg-spoiler>$1</tg-spoiler>");
+
+  // Markdown blockquotes. Telegram supports <blockquote>; keep each quote block compact.
+  result = result.replace(/(^&gt; ?.*(?:\n&gt; ?.*)*)/gm, (quoteBlock) => {
+    const body = quoteBlock.replace(/^&gt; ?/gm, "").trim();
+    return `<blockquote>${body}</blockquote>`;
+  });
+
+  // Normalize unordered lists to a Telegram-friendly bullet glyph.
+  result = result.replace(/^\s*[-*]\s+/gm, "• ");
+
+  result = result.replace(/§§CODEBLOCK_(\d+)§§/g, (_m, idx) => blocks[Number(idx)] ?? "");
+  result = result.replace(/§§INLINE_(\d+)§§/g, (_m, idx) => inlines[Number(idx)] ?? "");
 
   return result;
 }
@@ -527,7 +557,7 @@ export default function (pi: ExtensionAPI) {
           timeout: 60_000,
           maxBuffer: 1024 * 1024,
         }).trim();
-        await ctx.reply((output || "OK").slice(0, 3900), { disable_web_page_preview: true });
+        await sendTelegram(ctx.chat.id.toString(), output || "OK", "HTML");
       } catch (err: any) {
         const msg = err?.stderr?.toString?.() || err?.stdout?.toString?.() || err?.message || String(err);
         await ctx.reply("❌ stocknews failed:\n" + msg.slice(0, 3500));
@@ -900,18 +930,21 @@ export default function (pi: ExtensionAPI) {
   async function sendTelegram(chatId: string, text: string, parseMode?: "HTML" | "Markdown"): Promise<void> {
     if (!bot) return;
 
-    const chunks = splitMessage(text, 4000);
+    const chunks = splitMessage(text, 3900);
     for (const chunk of chunks) {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          await bot.api.sendMessage(chatId, chunk, parseMode ? { parse_mode: parseMode } : {});
+          await bot.api.sendMessage(chatId, chunk, {
+            ...(parseMode ? { parse_mode: parseMode } : {}),
+            disable_web_page_preview: true,
+          });
           break;
         } catch (err) {
           if (attempt === 2) {
-            // Last attempt: try without formatting
+            // Last attempt: try without formatting. This is especially useful when Telegram rejects malformed HTML.
             try {
               const plain = chunk.replace(/<[^>]+>/g, "");
-              await bot.api.sendMessage(chatId, plain);
+              await bot.api.sendMessage(chatId, plain, { disable_web_page_preview: true });
             } catch {
               console.error("Failed to send message after 3 retries:", err);
             }
@@ -924,8 +957,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function sendTelegramHtml(chatId: string, markdown: string): Promise<void> {
-    const html = markdownToHtml(markdown);
-    await sendTelegram(chatId, html, "HTML");
+    // Split markdown before conversion so HTML tags/entities are not cut across Telegram messages.
+    const chunks = splitMessage(markdown, 3300);
+    for (const chunk of chunks) {
+      await sendTelegram(chatId, markdownToHtml(chunk), "HTML");
+    }
   }
 
   // ─── Streaming ────────────────────────────────────────────────────────

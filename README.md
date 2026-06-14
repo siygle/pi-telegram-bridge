@@ -12,6 +12,7 @@ A [pi coding agent](https://github.com/nickarino/pi-coding-agent) extension that
 - 🤖 **Model switching** — Change models on the fly via `/model`
 - 💬 **Reply context** — Reply to messages to include context
 - 📋 **Slash commands** — `/new`, `/abort`, `/status`, `/model`, `/compact`, `/help`
+- ✨ **Rich message formatting** — Markdown responses are rendered with Telegram Bot API HTML (`<b>`, `<i>`, `<u>`, `<s>`, `<tg-spoiler>`, `<blockquote>`, `<code>`, `<pre><code class="language-*">`, links)
 
 ## Installation
 
@@ -127,7 +128,7 @@ The bridge auto-detects `GROQ_API_KEY` and defaults the provider to `groq` with 
 
 1. The extension registers as a pi extension and starts a Telegram bot via [grammY](https://grammy.dev/)
 2. Incoming Telegram messages are forwarded to the pi agent as user messages
-3. Agent responses (from `turn_end` events) are sent back to Telegram with HTML formatting
+3. Agent responses (from `turn_end` events) are converted from Markdown to Telegram Bot API HTML rich formatting and sent with link previews disabled
 4. Images from tool results (e.g., generated posters, screenshots) are automatically sent to Telegram
 5. Unauthorized users are rejected with their user ID displayed (for easy whitelisting)
 
