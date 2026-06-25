@@ -390,6 +390,32 @@ export default function (pi: ExtensionAPI) {
   let streamState: StreamState | null = null;
   let isConnected = false;
   let memoryDump: string | null = null;
+  // Whether the current turn was initiated by this bridge (captured at turn_start,
+  // stays stable for the whole turn).
+  let ownsCurrentTurn = false;
+
+  // ─── Turn Ownership ──────────────────────────────────────────────────
+  // Multiple bridges (e.g. Telegram + Slack) can run in the same pi process,
+  // sharing one conversation and listening to the same global events. Without
+  // coordination, each bridge reacts to every turn_end and cross-posts replies
+  // that were meant for the other platform. We share the "owner" of the current
+  // turn via globalThis so each bridge only handles turns it initiated.
+  const BRIDGE_OWNER_KEY = "__PI_BRIDGE_ACTIVE_OWNER";
+  const BRIDGE_ID = "telegram";
+
+  function claimTurnOwnership(): void {
+    (globalThis as any)[BRIDGE_OWNER_KEY] = BRIDGE_ID;
+  }
+
+  function isTurnOwner(): boolean {
+    return (globalThis as any)[BRIDGE_OWNER_KEY] === BRIDGE_ID;
+  }
+
+  function releaseTurnOwnership(): void {
+    if ((globalThis as any)[BRIDGE_OWNER_KEY] === BRIDGE_ID) {
+      (globalThis as any)[BRIDGE_OWNER_KEY] = null;
+    }
+  }
 
   // ─── Bot Management ──────────────────────────────────────────────────────
 
@@ -465,6 +491,7 @@ export default function (pi: ExtensionAPI) {
       latestCtx.abort();
       pendingChat = null;
       streamState = null;
+      releaseTurnOwnership();
       await ctx.reply("🛑 Generation aborted.");
     });
 
@@ -876,6 +903,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function forwardToPi(content: string | any[]): void {
+    claimTurnOwnership();
     try {
       if (latestCtx?.isIdle()) {
         pi.sendUserMessage(content);
@@ -1067,6 +1095,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     latestCtx = ctx;
+    // Lock ownership at the start of the turn; this stays fixed for the whole
+    // turn even if the other bridge claims afterwards.
+    ownsCurrentTurn = isTurnOwner();
+    if (!ownsCurrentTurn) return;
     if (!pendingChat || !bot) return;
 
     try {
@@ -1075,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_start", async (event, _ctx) => {
+    if (!ownsCurrentTurn) return;
     if (!pendingChat || !config.telegram?.stream) return;
     if (event.message?.role !== "assistant") return;
 
@@ -1087,6 +1120,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_update", async (event, _ctx) => {
+    if (!ownsCurrentTurn) return;
     if (!streamState || !config.telegram?.stream) return;
 
     const text = extractText(event.message);
@@ -1107,6 +1141,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (event, ctx) => {
     latestCtx = ctx;
+    if (!ownsCurrentTurn) return;
     if (!pendingChat) return;
 
     const message = event.message;
@@ -1144,11 +1179,13 @@ export default function (pi: ExtensionAPI) {
     // Clear pending chat when no more tool calls
     if (!hasPending) {
       pendingChat = null;
+      releaseTurnOwnership();
     }
   });
 
   // Detect images in tool results and send to Telegram
   pi.on("tool_execution_end", async (event, _ctx) => {
+    if (!ownsCurrentTurn) return;
     if (!pendingChat || !bot) return;
 
     const result = event.result;
