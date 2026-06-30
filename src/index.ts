@@ -449,8 +449,16 @@ export default function (pi: ExtensionAPI) {
     bot.command("new", async (ctx) => {
       if (!latestCtx) return;
       try {
-        pi.sendUserMessage("/tg-new", { deliverAs: "steer" });
         await ctx.reply("🆕 Starting new session...");
+        // Inject /tg-new through pi's real input pipeline via herdr so the
+        // registered command actually dispatches. pi.sendUserMessage() skips
+        // slash-command dispatch, so it can't start a session on its own.
+        const paneId = process.env.HERDR_PANE_ID;
+        if (process.env.HERDR_ENV === "1" && paneId) {
+          execFileSync("herdr", ["pane", "run", paneId, "/tg-new"]);
+        } else {
+          pi.sendUserMessage("/tg-new", { deliverAs: "steer" });
+        }
       } catch (err: any) {
         await ctx.reply("❌ " + err.message);
       }
