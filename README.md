@@ -8,7 +8,8 @@ A [pi coding agent](https://github.com/nickarino/pi-coding-agent) extension that
 - 🖼️ **Image support** — Send photos for vision/analysis
 - 🎙️ **Voice / audio / video_note support** — Auto-transcribed via Groq Whisper (free tier) or OpenAI
 - 📡 **Streaming mode** — Watch responses appear in real-time (optional)
-- 🔐 **Auth control** — Whitelist trusted Telegram users by ID
+- 🔐 **Auth control** — Whitelist trusted Telegram users by ID and explicitly trusted group chats
+- 🧭 **Isolated chat routing** — Private chats and family groups are mapped to separate pi session files to avoid context mixing
 - 🤖 **Model switching** — Change models on the fly via `/model`
 - 💬 **Reply context** — Reply to messages to include context
 - 📋 **Slash commands** — `/new`, `/abort`, `/status`, `/model`, `/compact`, `/help`
@@ -55,7 +56,12 @@ Config is stored in `~/.pi/telegram-bridge.json`:
     "streamThrottleMs": 1500
   },
   "auth": {
-    "trustedUsers": ["telegram:123456789"]
+    "trustedUsers": ["telegram:123456789"],
+    "trustedChats": ["telegram-chat:-1001234567890"],
+    "chatSessions": {
+      "telegram-chat:123456789": "/path/to/private-session.jsonl",
+      "telegram-chat:-1001234567890": "/path/to/family-group-session.jsonl"
+    }
   },
   "autoConnect": true,
   "stt": {
@@ -73,6 +79,8 @@ Config is stored in `~/.pi/telegram-bridge.json`:
 | `telegram.stream` | `PI_TELEGRAM_STREAM` | Enable streaming responses (`true`/`false`) |
 | `telegram.streamThrottleMs` | `PI_TELEGRAM_STREAM_THROTTLE` | Minimum ms between stream edits (default: 1500) |
 | `auth.trustedUsers` | `PI_TELEGRAM_TRUSTED_USERS` | Comma-separated Telegram user IDs |
+| `auth.trustedChats` | `PI_TELEGRAM_TRUSTED_CHATS` | Comma-separated Telegram chat/group IDs. Private chats from trusted users are allowed automatically; group chats must be trusted explicitly. |
+| `auth.chatSessions` | — | Internal per-chat session-file mapping used to isolate private and family-group conversation history. |
 | `autoConnect` | `PI_TELEGRAM_AUTO_CONNECT` | Auto-connect on pi startup |
 | `stt.provider` | `PI_TELEGRAM_STT_PROVIDER` | `groq` (default), `openai`, or `none` |
 | `stt.apiKey` | `PI_TELEGRAM_STT_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` | API key for the STT provider |
@@ -111,6 +119,9 @@ The bridge auto-detects `GROQ_API_KEY` and defaults the provider to `groq` with 
 | `/tg config` | Show current config |
 | `/tg token <tok>` | Set bot token |
 | `/tg trust <id>` | Add a trusted user |
+| `/tg trust-chat <id>` | Add a trusted private/family group chat |
+| `/tg untrust-chat <id>` | Remove a trusted chat and its isolated session mapping |
+| `/tg routes` | Show trusted chats and per-chat session mappings |
 | `/tg stream on\|off` | Toggle streaming mode |
 
 ### In Telegram
