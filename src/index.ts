@@ -15,10 +15,6 @@ interface TelegramConfig {
 
 interface AuthConfig {
   trustedUsers?: string[];
-  /** Trusted Telegram chat IDs. Private chats are always allowed for trusted users; groups must be explicitly trusted. */
-  trustedChats?: string[];
-  /** Per-chat pi session mapping to keep private and group conversations isolated. */
-  chatSessions?: Record<string, string>;
 }
 
 interface STTConfig {
@@ -50,32 +46,11 @@ interface StreamState {
   throttleTimer?: ReturnType<typeof setTimeout>;
 }
 
-interface TelegramJob {
-  id: string;
-  chatId: string;
-  chatKey: string;
-  chatType: string;
-  username: string;
-  userId: string;
-  content?: string | any[];
-  kind: "message" | "new" | "compact";
-}
-
-interface RouteState {
-  activeChatId?: string;
-  activeChatKey?: string;
-  activeUsername?: string;
-  activeUserId?: string;
-  jobId?: string;
-  startedAt?: number;
-}
-
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.json");
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".pi", "msg-bridge.json");
 const LOCK_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.lock");
-const ROUTE_STATE_PATH = path.join(os.homedir(), ".pi", "telegram-bridge-route-state.json");
 const MEMORY_SCRIPT_PATH = path.join(os.homedir(), ".pi", "agent", "skills", "memory", "scripts", "memory.sh");
 const MEMORY_PROMPT_HEADER = [
   "[Persistent user memory loaded at session start]",
@@ -120,13 +95,9 @@ function loadConfig(): BridgeConfig {
   if (process.env.PI_TELEGRAM_TRUSTED_USERS) {
     const users = process.env.PI_TELEGRAM_TRUSTED_USERS.split(",").map((id) => {
       const trimmed = id.trim();
-      return normalizeUserId(trimmed);
+      return trimmed.startsWith("telegram:") ? trimmed : `telegram:${trimmed}`;
     });
     config.auth = { ...config.auth, trustedUsers: users };
-  }
-  if (process.env.PI_TELEGRAM_TRUSTED_CHATS) {
-    const chats = process.env.PI_TELEGRAM_TRUSTED_CHATS.split(",").map((id) => normalizeChatId(id.trim()));
-    config.auth = { ...config.auth, trustedChats: chats };
   }
   if (process.env.PI_TELEGRAM_AUTO_CONNECT !== undefined) {
     config.autoConnect = process.env.PI_TELEGRAM_AUTO_CONNECT === "true";
@@ -201,116 +172,6 @@ function saveConfig(config: BridgeConfig): void {
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   }
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
-}
-
-function normalizeUserId(id: string): string {
-  return id.startsWith("telegram:") ? id : `telegram:${id}`;
-}
-
-function normalizeChatId(id: string): string {
-  return id.startsWith("telegram-chat:") ? id : `telegram-chat:${id}`;
-}
-
-function getChatKey(chatId: string): string {
-  return normalizeChatId(chatId);
-}
-
-function isTrustedChatId(chatId: string | undefined, trustedChats: string[] | undefined): boolean {
-  if (!chatId) return false;
-  const chats = new Set(trustedChats ?? []);
-  if (chats.has(normalizeChatId(chatId))) return true;
-  // Backward compatibility for accidentally added supergroup IDs without the leading "-".
-  // Example: actual chat id "-100123" vs stored "telegram-chat:100123".
-  if (chatId.startsWith("-")) return chats.has(normalizeChatId(chatId.slice(1)));
-  return false;
-}
-
-function isGroupTelegramChat(chatType: string | undefined): boolean {
-  return chatType === "group" || chatType === "supergroup";
-}
-
-function getBotUsername(ctx: any): string | undefined {
-  return ctx.me?.username || ctx.api?.config?.botInfo?.username;
-}
-
-function isReplyToBot(ctx: any): boolean {
-  const botId = ctx.me?.id;
-  const replyFromId = ctx.message?.reply_to_message?.from?.id;
-  return !!botId && !!replyFromId && botId === replyFromId;
-}
-
-function messageMentionsBot(ctx: any): boolean {
-  const username = getBotUsername(ctx);
-  if (!username) return false;
-  const mention = `@${username}`.toLowerCase();
-  const text = (ctx.message?.text || ctx.message?.caption || "") as string;
-  return text.toLowerCase().includes(mention);
-}
-
-function shouldHandleGroupMessage(ctx: any): boolean {
-  if (!isGroupTelegramChat(ctx.chat?.type)) return true;
-  return isReplyToBot(ctx) || messageMentionsBot(ctx);
-}
-
-function stripBotMention(ctx: any, text: string): string {
-  const username = getBotUsername(ctx);
-  if (!username) return text;
-  return text.replace(new RegExp(`@${username}\\b`, "ig"), "").trim();
-}
-
-function telegramSourceLabel(ctx: any): string {
-  const username = ctx.from?.username || ctx.from?.first_name || "user";
-  const chatId = ctx.chat?.id?.toString() || "unknown";
-  const chatType = ctx.chat?.type || "unknown";
-  const scope = isPrivateTelegramChat(chatType) ? "private" : chatType;
-  return `[📱 ${scope} ${chatId} @${username} via telegram]`;
-}
-
-function ensureAuthConfig(config: BridgeConfig): AuthConfig {
-  if (!config.auth) config.auth = {};
-  if (!config.auth.trustedUsers) config.auth.trustedUsers = [];
-  if (!config.auth.trustedChats) config.auth.trustedChats = [];
-  if (!config.auth.chatSessions) config.auth.chatSessions = {};
-  return config.auth;
-}
-
-function loadRouteState(): RouteState | null {
-  if (!fs.existsSync(ROUTE_STATE_PATH)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(ROUTE_STATE_PATH, "utf-8")) as RouteState;
-  } catch {
-    return null;
-  }
-}
-
-function saveRouteState(state: RouteState): void {
-  const dir = path.dirname(ROUTE_STATE_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(ROUTE_STATE_PATH, JSON.stringify(state, null, 2), { mode: 0o600 });
-}
-
-function clearRouteState(): void {
-  try {
-    if (fs.existsSync(ROUTE_STATE_PATH)) fs.unlinkSync(ROUTE_STATE_PATH);
-  } catch {}
-}
-
-function isPrivateTelegramChat(chatType?: string): boolean {
-  return chatType === "private";
-}
-
-function makeJob(ctx: any, kind: TelegramJob["kind"], content?: string | any[]): TelegramJob {
-  const chatId = ctx.chat.id.toString();
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    chatId,
-    chatKey: getChatKey(chatId),
-    chatType: ctx.chat.type || "unknown",
-    username: ctx.from?.username || ctx.from?.first_name || "user",
-    userId: ctx.from?.id?.toString() || "",
-    content,
-    kind,
-  };
 }
 
 function loadMemoryDump(): string | null {
@@ -528,151 +389,6 @@ export default function (pi: ExtensionAPI) {
   let streamState: StreamState | null = null;
   let isConnected = false;
   let memoryDump: string | null = null;
-  const telegramJobs = new Map<string, TelegramJob>();
-
-  function rememberPendingChat(job: TelegramJob): void {
-    pendingChat = {
-      chatId: job.chatId,
-      username: job.username,
-      userId: job.userId,
-    };
-    saveRouteState({
-      activeChatId: job.chatId,
-      activeChatKey: job.chatKey,
-      activeUsername: job.username,
-      activeUserId: job.userId,
-      jobId: job.id,
-      startedAt: Date.now(),
-    });
-  }
-
-  function restorePendingChatFromRouteState(): void {
-    const state = loadRouteState();
-    if (!state?.activeChatId) return;
-    pendingChat = {
-      chatId: state.activeChatId,
-      username: state.activeUsername || "user",
-      userId: state.activeUserId || "",
-    };
-  }
-
-  function runPiCommand(command: string): boolean {
-    const paneId = process.env.HERDR_PANE_ID;
-    if (process.env.HERDR_ENV !== "1" || !paneId) return false;
-    execFileSync("herdr", ["pane", "run", paneId, command]);
-    return true;
-  }
-
-  async function enqueueTelegramJob(ctx: any, job: TelegramJob): Promise<void> {
-    telegramJobs.set(job.id, job);
-    if (!runPiCommand(`/tg-dispatch ${job.id}`)) {
-      telegramJobs.delete(job.id);
-      await ctx.reply("❌ Telegram session routing requires pi TUI/herdr. Unable to dispatch safely.");
-    }
-  }
-
-  async function dispatchJobToSession(job: TelegramJob, ctx: any): Promise<void> {
-    if (ctx.waitForIdle && !ctx.isIdle()) {
-      await ctx.waitForIdle();
-    }
-
-    config = loadConfig();
-    const auth = ensureAuthConfig(config);
-    const currentSession = ctx.sessionManager.getSessionFile();
-    let targetSession = auth.chatSessions?.[job.chatKey];
-
-    const sendInCurrentSession = async () => {
-      rememberPendingChat(job);
-      if (job.kind === "new") {
-        await sendTelegram(job.chatId, "🆕 This chat already has a fresh active session.");
-      } else if (job.kind === "compact") {
-        ctx.compact({
-          onComplete: () => sendTelegram(job.chatId, "✅ Compaction complete."),
-          onError: (err: Error) => sendTelegram(job.chatId, "❌ Compaction failed: " + err.message),
-        });
-        await sendTelegram(job.chatId, "📦 Compacting this chat session...");
-      } else if (job.content) {
-        pi.sendUserMessage(job.content);
-      }
-    };
-
-    const createIsolatedSession = async () => {
-      rememberPendingChat(job);
-      await ctx.newSession({
-        parentSession: currentSession,
-        setup: async (sessionManager: any) => {
-          sessionManager.appendMessage({
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: `Telegram isolated chat session created for ${job.chatType} ${job.chatId}. Keep this chat's context separate from other Telegram chats.`,
-              },
-            ],
-            timestamp: Date.now(),
-          });
-        },
-        withSession: async (newCtx: any) => {
-          const nextConfig = loadConfig();
-          const nextAuth = ensureAuthConfig(nextConfig);
-          const newSessionFile = newCtx.sessionManager.getSessionFile();
-          if (newSessionFile) {
-            nextAuth.chatSessions![job.chatKey] = newSessionFile;
-            saveConfig(nextConfig);
-          }
-          if (job.kind === "new") {
-            await sendTelegram(job.chatId, "🆕 Started a new isolated session for this chat.");
-          } else if (job.kind === "compact") {
-            newCtx.compact({
-              onComplete: () => sendTelegram(job.chatId, "✅ Compaction complete."),
-              onError: (err: Error) => sendTelegram(job.chatId, "❌ Compaction failed: " + err.message),
-            });
-            await sendTelegram(job.chatId, "📦 Compacting this chat session...");
-          } else if (job.content) {
-            await newCtx.sendUserMessage(job.content);
-          }
-        },
-      });
-    };
-
-    if (!targetSession) {
-      if (isPrivateTelegramChat(job.chatType) && currentSession) {
-        auth.chatSessions![job.chatKey] = currentSession;
-        saveConfig(config);
-        targetSession = currentSession;
-      } else {
-        await createIsolatedSession();
-        return;
-      }
-    }
-
-    if (job.kind === "new") {
-      delete auth.chatSessions![job.chatKey];
-      saveConfig(config);
-      await createIsolatedSession();
-      return;
-    }
-
-    if (!currentSession || targetSession === currentSession) {
-      await sendInCurrentSession();
-      return;
-    }
-
-    rememberPendingChat(job);
-    await ctx.switchSession(targetSession, {
-      withSession: async (newCtx: any) => {
-        if (job.kind === "compact") {
-          newCtx.compact({
-            onComplete: () => sendTelegram(job.chatId, "✅ Compaction complete."),
-            onError: (err: Error) => sendTelegram(job.chatId, "❌ Compaction failed: " + err.message),
-          });
-          await sendTelegram(job.chatId, "📦 Compacting this chat session...");
-        } else if (job.content) {
-          await newCtx.sendUserMessage(job.content);
-        }
-      },
-    });
-  }
 
   // ─── Bot Management ──────────────────────────────────────────────────────
 
@@ -696,38 +412,17 @@ export default function (pi: ExtensionAPI) {
     }
 
     bot = new Bot(token);
+    const trustedUsers = new Set(config.auth?.trustedUsers ?? []);
 
     // ─── Auth Middleware ────────────────────────────────────────────────
     bot.use(async (ctx, next) => {
-      // Reload auth dynamically so /tg trust-chat takes effect without reconnecting the bot.
-      config = loadConfig();
-      const auth = ensureAuthConfig(config);
       const userId = ctx.from?.id?.toString();
-      const chatId = ctx.chat?.id?.toString();
-      const chatType = ctx.chat?.type;
-      const userAllowed = !!userId && new Set(auth.trustedUsers ?? []).has(normalizeUserId(userId));
-      const chatAllowed = isPrivateTelegramChat(chatType) || isTrustedChatId(chatId, auth.trustedChats);
-
-      if (!userAllowed) {
+      if (!userId || !trustedUsers.has(`telegram:${userId}`)) {
         if (ctx.message) {
           await ctx.reply("⛔ Unauthorized. Your user ID: " + userId);
         }
         return;
       }
-
-      if (!chatAllowed) {
-        if (ctx.message) {
-          await ctx.reply(
-            [
-              "⛔ Unauthorized chat.",
-              `Chat ID: ${chatId}`,
-              "在 pi 內執行 /tg trust-chat <chat-id> 後，這個群組才可以使用。",
-            ].join("\n"),
-          );
-        }
-        return;
-      }
-
       await next();
     });
 
@@ -752,8 +447,16 @@ export default function (pi: ExtensionAPI) {
     bot.command("new", async (ctx) => {
       if (!latestCtx) return;
       try {
-        await ctx.reply("🆕 Starting a new isolated session for this chat...");
-        await enqueueTelegramJob(ctx, makeJob(ctx, "new"));
+        await ctx.reply("🆕 Starting new session...");
+        // Inject /tg-new through pi's real input pipeline via herdr so the
+        // registered command actually dispatches. pi.sendUserMessage() skips
+        // slash-command dispatch, so it can't start a session on its own.
+        const paneId = process.env.HERDR_PANE_ID;
+        if (process.env.HERDR_ENV === "1" && paneId) {
+          execFileSync("herdr", ["pane", "run", paneId, "/tg-new"]);
+        } else {
+          pi.sendUserMessage("/tg-new", { deliverAs: "steer" });
+        }
       } catch (err: any) {
         await ctx.reply("❌ " + err.message);
       }
@@ -761,11 +464,6 @@ export default function (pi: ExtensionAPI) {
 
     bot.command("abort", async (ctx) => {
       if (!latestCtx) return;
-      const chatId = ctx.chat.id.toString();
-      if (!pendingChat || pendingChat.chatId !== chatId) {
-        await ctx.reply("🛡️ This chat has no active generation to abort, so I will not affect another chat.");
-        return;
-      }
       if (latestCtx.isIdle()) {
         await ctx.reply("💤 Agent is already idle.");
         return;
@@ -773,8 +471,7 @@ export default function (pi: ExtensionAPI) {
       latestCtx.abort();
       pendingChat = null;
       streamState = null;
-      clearRouteState();
-      await ctx.reply("🛑 Generation aborted for this chat.");
+      await ctx.reply("🛑 Generation aborted.");
     });
 
     bot.command("status", async (ctx) => {
@@ -787,19 +484,12 @@ export default function (pi: ExtensionAPI) {
       const idle = latestCtx.isIdle();
       const streaming = config.telegram?.stream ? "ON" : "OFF";
 
-      const auth = ensureAuthConfig(config);
-      const chatKey = getChatKey(ctx.chat.id.toString());
-      const sessionKnown = auth.chatSessions?.[chatKey] ? "✅ isolated" : "not initialized yet";
-      const activeForThisChat = pendingChat?.chatId === ctx.chat.id.toString();
-
       const lines = [
         "<b>📊 Status</b>",
         "",
         `🤖 Model: <code>${model?.provider ?? "?"}/${model?.id ?? "?"}</code>`,
         `💬 State: ${idle ? "💤 Idle" : "⚡ Processing"}`,
         `📡 Streaming: ${streaming}`,
-        `🔒 This chat session: ${sessionKnown}`,
-        `🎯 Active response target: ${activeForThisChat ? "this chat" : pendingChat ? "another chat" : "none"}`,
       ];
 
       if (usage) {
@@ -811,11 +501,6 @@ export default function (pi: ExtensionAPI) {
     });
 
     bot.command("model", async (ctx) => {
-      if (!isPrivateTelegramChat(ctx.chat.type)) {
-        await ctx.reply("🛡️ /model is private-chat only so family group settings cannot affect your private conversation.");
-        return;
-      }
-
       const pattern = ctx.match?.trim();
 
       if (pattern) {
@@ -848,8 +533,11 @@ export default function (pi: ExtensionAPI) {
 
     bot.command("compact", async (ctx) => {
       if (!latestCtx) return;
-      await ctx.reply("📦 Compacting this chat's isolated session...");
-      await enqueueTelegramJob(ctx, makeJob(ctx, "compact"));
+      latestCtx.compact({
+        onComplete: () => sendTelegram(ctx.chat.id.toString(), "✅ Compaction complete."),
+        onError: (err) => sendTelegram(ctx.chat.id.toString(), "❌ Compaction failed: " + err.message),
+      });
+      await ctx.reply("📦 Compacting conversation...");
     });
 
 
@@ -905,7 +593,6 @@ export default function (pi: ExtensionAPI) {
     // ─── Photo Messages ─────────────────────────────────────────────────
 
     bot.on("message:photo", async (ctx) => {
-      if (!shouldHandleGroupMessage(ctx)) return;
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
       const file = await ctx.api.getFile(largest.file_id);
@@ -920,24 +607,26 @@ export default function (pi: ExtensionAPI) {
       const buffer = Buffer.from(await response.arrayBuffer());
       const base64 = buffer.toString("base64");
 
-      const source = telegramSourceLabel(ctx);
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
       const caption = ctx.message.caption || "Please analyze this image.";
 
       const replyContext = await extractReplyContext(ctx);
       const textParts = replyContext
-        ? `${replyContext}\n\n${source}: ${caption}`
-        : `${source}: ${caption}`;
+        ? `${replyContext}\n\n[📱 @${username} via telegram]: ${caption}`
+        : `[📱 @${username} via telegram]: ${caption}`;
 
-      await enqueueTelegramJob(ctx, makeJob(ctx, "message", [
-        { type: "text" as const, text: textParts },
-        { type: "image" as const, mimeType: "image/jpeg" as const, data: base64 },
-      ]));
+      setPendingChat(ctx);
+      forwardToPi(
+        [
+          { type: "text" as const, text: textParts },
+          { type: "image" as const, mimeType: "image/jpeg" as const, data: base64 },
+        ],
+      );
     });
 
     // ─── Document / File Messages ───────────────────────────────────────
 
     bot.on("message:document", async (ctx) => {
-      if (!shouldHandleGroupMessage(ctx)) return;
       const doc = ctx.message.document;
       if (!doc) return;
 
@@ -962,7 +651,7 @@ export default function (pi: ExtensionAPI) {
       const filePath = path.join(uploadDir, `${timestamp}-${sanitizedName}`);
       fs.writeFileSync(filePath, buffer);
 
-      const source = telegramSourceLabel(ctx);
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
       const caption = ctx.message.caption || "";
       const fileSize = doc.file_size ? `${(doc.file_size / 1024).toFixed(1)}KB` : "unknown size";
 
@@ -979,21 +668,23 @@ export default function (pi: ExtensionAPI) {
 
         const textParts = [
           replyContext,
-          `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+          `[📱 @${username} via telegram][📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
         ].filter(Boolean).join("\n\n");
 
-        await enqueueTelegramJob(ctx, makeJob(ctx, "message", [
+        setPendingChat(ctx);
+        forwardToPi([
           { type: "text" as const, text: textParts },
           { type: "image" as const, mimeType: imgMime, data: base64 },
-        ]));
+        ]);
       } else {
         // Non-image file: send as text with file path
         const textParts = [
           replyContext,
-          `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+          `[📱 @${username} via telegram][📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
         ].filter(Boolean).join("\n\n");
 
-        await enqueueTelegramJob(ctx, makeJob(ctx, "message", textParts));
+        setPendingChat(ctx);
+        forwardToPi(textParts);
       }
     });
 
@@ -1004,7 +695,6 @@ export default function (pi: ExtensionAPI) {
       media: { file_id: string; mime_type?: string; duration?: number; file_name?: string; file_size?: number },
       kind: "voice" | "audio" | "video_note",
     ): Promise<void> {
-      if (!shouldHandleGroupMessage(ctx)) return;
       const file = await ctx.api.getFile(media.file_id);
       if (!file.file_path) {
         await ctx.reply(`❌ Could not download ${kind}.`);
@@ -1043,11 +733,11 @@ export default function (pi: ExtensionAPI) {
         sttError = result.error;
       }
 
-      const source = telegramSourceLabel(ctx);
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
       const caption = (ctx.message as any).caption || "";
       const replyContext = await extractReplyContext(ctx);
 
-      const header = `${source}[🎙️ ${kind}, ${duration}s, ${sizeStr}, file: ${filePath}]`;
+      const header = `[📱 @${username} via telegram][🎙️ ${kind}, ${duration}s, ${sizeStr}, file: ${filePath}]`;
       let body: string;
       if (transcript) {
         body = `${header}: ${transcript}`;
@@ -1059,7 +749,8 @@ export default function (pi: ExtensionAPI) {
       if (caption) body = `${body}\n\n[caption]: ${caption}`;
 
       const textParts = replyContext ? `${replyContext}\n\n${body}` : body;
-      await enqueueTelegramJob(ctx, makeJob(ctx, "message", textParts));
+      setPendingChat(ctx);
+      forwardToPi(textParts);
     }
 
     bot.on("message:voice", async (ctx) => {
@@ -1079,18 +770,17 @@ export default function (pi: ExtensionAPI) {
     bot.on("message:text", async (ctx) => {
       // Skip commands (already handled above)
       if (ctx.message.text.startsWith("/")) return;
-      if (!shouldHandleGroupMessage(ctx)) return;
 
-      const source = telegramSourceLabel(ctx);
-      const text = stripBotMention(ctx, ctx.message.text);
-      if (!text && isGroupTelegramChat(ctx.chat?.type) && !isReplyToBot(ctx)) return;
+      const username = ctx.from?.username || ctx.from?.first_name || "user";
+      const text = ctx.message.text;
 
       const replyContext = await extractReplyContext(ctx);
       const message = replyContext
-        ? `${replyContext}\n\n${source}: ${text}`
-        : `${source}: ${text}`;
+        ? `${replyContext}\n\n[📱 @${username} via telegram]: ${text}`
+        : `[📱 @${username} via telegram]: ${text}`;
 
-      await enqueueTelegramJob(ctx, makeJob(ctx, "message", message));
+      setPendingChat(ctx);
+      forwardToPi(message);
     });
 
     // ─── Error Handler ──────────────────────────────────────────────────
@@ -1354,7 +1044,6 @@ export default function (pi: ExtensionAPI) {
     latestCtx = ctx;
     config = loadConfig();
     memoryDump = loadMemoryDump();
-    restorePendingChatFromRouteState();
 
     if (!memoryDump) {
       ctx.ui.notify("⚠️ Persistent memory not loaded", "warning");
@@ -1452,7 +1141,6 @@ export default function (pi: ExtensionAPI) {
     // Clear pending chat when no more tool calls
     if (!hasPending) {
       pendingChat = null;
-      clearRouteState();
     }
   });
 
@@ -1517,7 +1205,7 @@ export default function (pi: ExtensionAPI) {
             : " | Lock: none";
           ctx.ui.notify(
             isConnected
-              ? `📱 Telegram connected | Stream: ${config.telegram?.stream ? "ON" : "OFF"} | Trusted: ${config.auth?.trustedUsers?.length ?? 0} users, ${config.auth?.trustedChats?.length ?? 0} chats | Sessions: ${Object.keys(config.auth?.chatSessions ?? {}).length}${lockInfo}`
+              ? `📱 Telegram connected | Stream: ${config.telegram?.stream ? "ON" : "OFF"} | Trusted: ${config.auth?.trustedUsers?.length ?? 0} users${lockInfo}`
               : `📱 Telegram disconnected${lockInfo}`,
             "info",
           );
@@ -1546,54 +1234,16 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify("Usage: /tg trust <user-id>", "warning");
             return;
           }
-          const fullId = normalizeUserId(userId);
-          const auth = ensureAuthConfig(config);
-          if (!auth.trustedUsers!.includes(fullId)) {
-            auth.trustedUsers!.push(fullId);
+          const fullId = userId.startsWith("telegram:") ? userId : `telegram:${userId}`;
+          if (!config.auth) config.auth = {};
+          if (!config.auth.trustedUsers) config.auth.trustedUsers = [];
+          if (!config.auth.trustedUsers.includes(fullId)) {
+            config.auth.trustedUsers.push(fullId);
             saveConfig(config);
             ctx.ui.notify(`✅ Trusted user added: ${fullId}`, "success");
           } else {
             ctx.ui.notify(`Already trusted: ${fullId}`, "info");
           }
-          break;
-        }
-
-        case "trust-chat": {
-          const chatId = rest[0]?.trim();
-          if (!chatId) {
-            ctx.ui.notify("Usage: /tg trust-chat <chat-id>", "warning");
-            return;
-          }
-          const fullId = normalizeChatId(chatId);
-          const auth = ensureAuthConfig(config);
-          if (!auth.trustedChats!.includes(fullId)) {
-            auth.trustedChats!.push(fullId);
-            saveConfig(config);
-            ctx.ui.notify(`✅ Trusted chat added: ${fullId}`, "success");
-          } else {
-            ctx.ui.notify(`Already trusted chat: ${fullId}`, "info");
-          }
-          break;
-        }
-
-        case "untrust-chat": {
-          const chatId = rest[0]?.trim();
-          if (!chatId) {
-            ctx.ui.notify("Usage: /tg untrust-chat <chat-id>", "warning");
-            return;
-          }
-          const fullId = normalizeChatId(chatId);
-          const auth = ensureAuthConfig(config);
-          auth.trustedChats = auth.trustedChats!.filter((id) => id !== fullId);
-          delete auth.chatSessions![fullId];
-          saveConfig(config);
-          ctx.ui.notify(`✅ Trusted chat removed: ${fullId}`, "success");
-          break;
-        }
-
-        case "routes": {
-          const auth = ensureAuthConfig(config);
-          ctx.ui.notify(JSON.stringify({ trustedChats: auth.trustedChats, chatSessions: auth.chatSessions }, null, 2), "info");
           break;
         }
 
@@ -1623,9 +1273,6 @@ export default function (pi: ExtensionAPI) {
               "  /tg config       — Show config",
               "  /tg token <tok>  — Set bot token",
               "  /tg trust <id>   — Add trusted user",
-              "  /tg trust-chat <id> — Add trusted private/family group chat",
-              "  /tg untrust-chat <id> — Remove trusted chat and its isolated session mapping",
-              "  /tg routes       — Show isolated chat/session mappings",
               "  /tg stream on|off — Toggle streaming",
             ].join("\n"),
             "info",
@@ -1635,26 +1282,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Internal dispatcher invoked through the real pi command pipeline so it can
-  // use command-only session APIs (newSession/switchSession) safely.
-  pi.registerCommand("tg-dispatch", {
-    description: "Internal Telegram bridge dispatcher",
-    handler: async (args, ctx) => {
-      latestCtx = ctx;
-      const jobId = (args || "").trim();
-      const job = telegramJobs.get(jobId);
-      if (!job) {
-        ctx.ui.notify(`⚠️ Telegram dispatch job not found: ${jobId}`, "warning");
-        return;
-      }
-      telegramJobs.delete(jobId);
-      await dispatchJobToSession(job, ctx);
-    },
-  });
-
-  // Backwards-compatible manual helper for Telegram's old /new path.
+  // Pi command for Telegram's /new
   pi.registerCommand("tg-new", {
-    description: "New session (legacy Telegram helper)",
+    description: "New session (triggered from Telegram)",
     handler: async (_args, ctx) => {
       await ctx.newSession();
     },
