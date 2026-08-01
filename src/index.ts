@@ -72,11 +72,35 @@ interface RouteState {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const CONFIG_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.json");
+// Multiple pi instances can each run their own Telegram bot by setting
+// PI_TELEGRAM_INSTANCE (e.g. "second"). Each instance then reads/writes its own
+// config, lock, and route-state files so bots, tokens, and polling locks stay isolated.
+function instanceSuffix(): string {
+  const raw = (process.env.PI_TELEGRAM_INSTANCE || "").trim();
+  if (!raw || raw === "default" || raw === "main") return "";
+  const safe = raw.replace(/[^a-zA-Z0-9_-]/g, "-");
+  return `-${safe}`;
+}
+
+const INSTANCE_SUFFIX = instanceSuffix();
+const CONFIG_PATH = path.join(os.homedir(), ".pi", `telegram-bridge${INSTANCE_SUFFIX}.json`);
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".pi", "msg-bridge.json");
-const LOCK_PATH = path.join(os.homedir(), ".pi", "telegram-bridge.lock");
-const ROUTE_STATE_PATH = path.join(os.homedir(), ".pi", "telegram-bridge-route-state.json");
+const LOCK_PATH = path.join(os.homedir(), ".pi", `telegram-bridge${INSTANCE_SUFFIX}.lock`);
+const ROUTE_STATE_PATH = path.join(os.homedir(), ".pi", `telegram-bridge${INSTANCE_SUFFIX}-route-state.json`);
 const MEMORY_SCRIPT_PATH = path.join(os.homedir(), ".pi", "agent", "skills", "memory", "scripts", "memory.sh");
+const DEBUG_LOG_PATH = path.join(os.homedir(), ".pi", "logs", `telegram-bridge${INSTANCE_SUFFIX}-debug.log`);
+
+// Opt-in tracing (PI_TELEGRAM_DEBUG=1) to a per-instance file, since a bot's
+// stdout is attached to its herdr pane and not easily inspectable during live debugging.
+function dbg(...args: any[]): void {
+  if (process.env.PI_TELEGRAM_DEBUG !== "1") return;
+  try {
+    const dir = path.dirname(DEBUG_LOG_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const parts = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a)));
+    fs.appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} ${parts.join(" ")}\n`);
+  } catch {}
+}
 const MEMORY_PROMPT_HEADER = [
   "[Persistent user memory loaded at session start]",
   "Use this memory as background context and preference guidance.",
@@ -527,6 +551,9 @@ export default function (pi: ExtensionAPI) {
   let pendingChat: PendingChat | null = null;
   let streamState: StreamState | null = null;
   let isConnected = false;
+  let reconnectAttempts = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  const MAX_RECONNECT_ATTEMPTS = 5;
   let memoryDump: string | null = null;
   const telegramJobs = new Map<string, TelegramJob>();
 
@@ -558,6 +585,7 @@ export default function (pi: ExtensionAPI) {
 
   function runPiCommand(command: string): boolean {
     const paneId = process.env.HERDR_PANE_ID;
+    dbg("runPiCommand", { command, HERDR_ENV: process.env.HERDR_ENV, paneId });
     if (process.env.HERDR_ENV !== "1" || !paneId) return false;
     execFileSync("herdr", ["pane", "run", paneId, command]);
     return true;
@@ -565,9 +593,25 @@ export default function (pi: ExtensionAPI) {
 
   async function enqueueTelegramJob(ctx: any, job: TelegramJob): Promise<void> {
     telegramJobs.set(job.id, job);
-    if (!runPiCommand(`/tg-dispatch ${job.id}`)) {
+    dbg("enqueue", { id: job.id, kind: job.kind, chatKey: job.chatKey, chatType: job.chatType });
+    let dispatched = false;
+    let dispatchError: string | undefined;
+    try {
+      dispatched = runPiCommand(`/tg-dispatch ${job.id}`);
+    } catch (e: any) {
+      dispatchError = e?.message || String(e);
+      dbg("runPiCommand threw", dispatchError);
+    }
+    if (!dispatched) {
       telegramJobs.delete(job.id);
-      await ctx.reply("❌ Telegram session routing requires pi TUI/herdr. Unable to dispatch safely.");
+      dbg("dispatch failed", { id: job.id, dispatchError });
+      await ctx.reply(
+        dispatchError
+          ? `❌ Telegram dispatch failed: ${dispatchError}`
+          : "❌ Telegram session routing requires pi TUI/herdr. Unable to dispatch safely.",
+      );
+    } else {
+      dbg("dispatched ok", { id: job.id });
     }
   }
 
@@ -707,6 +751,7 @@ export default function (pi: ExtensionAPI) {
       const chatType = ctx.chat?.type;
       const userAllowed = !!userId && new Set(auth.trustedUsers ?? []).has(normalizeUserId(userId));
       const chatAllowed = isPrivateTelegramChat(chatType) || isTrustedChatId(chatId, auth.trustedChats);
+      dbg("auth", { chatId, chatType, userId, userAllowed, chatAllowed, text: ctx.message?.text });
 
       if (!userAllowed) {
         if (ctx.message) {
@@ -1079,7 +1124,9 @@ export default function (pi: ExtensionAPI) {
     bot.on("message:text", async (ctx) => {
       // Skip commands (already handled above)
       if (ctx.message.text.startsWith("/")) return;
-      if (!shouldHandleGroupMessage(ctx)) return;
+      const handle = shouldHandleGroupMessage(ctx);
+      dbg("message:text", { chatId: ctx.chat?.id, chatType: ctx.chat?.type, me: getBotUsername(ctx), handle, text: ctx.message.text });
+      if (!handle) return;
 
       const source = telegramSourceLabel(ctx);
       const text = stripBotMention(ctx, ctx.message.text);
@@ -1095,18 +1142,46 @@ export default function (pi: ExtensionAPI) {
 
     // ─── Error Handler ──────────────────────────────────────────────────
 
+    function scheduleReconnect(reason: string): void {
+      if (reconnectTimer || isConnected || bot) return;
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        dbg("reconnect gave up", { reason, attempts: reconnectAttempts });
+        try {
+          latestCtx?.ui.notify(
+            `⚠️ Telegram bot still disconnected after ${MAX_RECONNECT_ATTEMPTS} retries (${reason}). Run /tg connect to retry.`,
+            "warning",
+          );
+        } catch {}
+        return;
+      }
+      const delayMs = Math.min(30_000, 2_000 * 2 ** reconnectAttempts);
+      reconnectAttempts++;
+      dbg("scheduleReconnect", { reason, attempt: reconnectAttempts, delayMs });
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (isConnected || bot) return;
+        config = loadConfig();
+        void connectBot();
+      }, delayMs);
+    }
+
     async function handlePollingConflict(): Promise<void> {
-      // Another instance took over polling — gracefully stop this one.
       // Telegram returns 409 when two long-polling getUpdates loops use the same bot token.
-      latestCtx?.ui.notify(
-        "⚠️ Telegram bot conflict detected (another instance is polling). Disconnecting this instance.",
-        "warning",
-      );
+      // The conflict may be a genuine second instance OR a transient overlap (restart race,
+      // a stray external getUpdates). Disconnect this poller, then retry with backoff instead
+      // of staying down permanently — a single 409 should not require manual /tg connect.
+      try {
+        latestCtx?.ui.notify(
+          "⚠️ Telegram polling conflict (409). Disconnecting and retrying shortly.",
+          "warning",
+        );
+      } catch {}
       try { await bot?.stop(); } catch {}
       bot = null;
       isConnected = false;
       releaseLock();
-      latestCtx?.ui.setStatus("tg", undefined);
+      try { latestCtx?.ui.setStatus("tg", undefined); } catch {}
+      scheduleReconnect("409 conflict");
     }
 
     bot.catch(async (err) => {
@@ -1140,8 +1215,15 @@ export default function (pi: ExtensionAPI) {
       drop_pending_updates: true,
       onStart: () => {
         isConnected = true;
-        latestCtx?.ui.setStatus("tg", "📱 Telegram connected");
-        latestCtx?.ui.notify("📱 Telegram bot connected", "info");
+        reconnectAttempts = 0;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        try {
+          latestCtx?.ui.setStatus("tg", "📱 Telegram connected");
+          latestCtx?.ui.notify("📱 Telegram bot connected", "info");
+        } catch {}
       },
     }).catch(async (e) => {
       if (e instanceof GrammyError && e.error_code === 409) {
@@ -1163,6 +1245,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function disconnectBot(): Promise<void> {
+    // Cancel any pending auto-reconnect so a manual disconnect stays disconnected.
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    reconnectAttempts = 0;
     if (!bot) return;
     await bot.stop();
     bot = null;
