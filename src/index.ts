@@ -180,6 +180,29 @@ function loadConfig(): BridgeConfig {
 
 // ─── STT (Speech-to-Text) ────────────────────────────────────────────────────
 
+// Whisper (OpenAI/Groq) validates the audio by the *filename extension*, not
+// the MIME type. Telegram voice notes arrive as `.oga` (Ogg Opus), which is a
+// valid container but an extension the API rejects. Map uncommon/unsupported
+// extensions onto an accepted one so transcription doesn't 400.
+const STT_ACCEPTED_EXTS = new Set([
+  "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "opus", "wav", "webm",
+]);
+
+function sttSafeFilename(filename: string, mimeType: string): string {
+  const dot = filename.lastIndexOf(".");
+  const base = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
+  if (STT_ACCEPTED_EXTS.has(ext)) return filename;
+  // `.oga` and other Ogg variants are Ogg Opus in practice.
+  let mapped = "ogg";
+  if (ext === "oga" || mimeType.includes("ogg") || mimeType.includes("opus")) mapped = "ogg";
+  else if (mimeType.includes("mp4") || mimeType.includes("m4a")) mapped = "m4a";
+  else if (mimeType.includes("mpeg") || mimeType.includes("mp3")) mapped = "mp3";
+  else if (mimeType.includes("wav")) mapped = "wav";
+  else if (mimeType.includes("webm")) mapped = "webm";
+  return `${base}.${mapped}`;
+}
+
 async function transcribeAudio(
   stt: STTConfig | undefined,
   buffer: Buffer,
@@ -197,7 +220,8 @@ async function transcribeAudio(
   const model = stt.model || (provider === "openai" ? "whisper-1" : "whisper-large-v3-turbo");
 
   const form = new FormData();
-  form.append("file", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+  const safeName = sttSafeFilename(filename, mimeType);
+  form.append("file", new Blob([new Uint8Array(buffer)], { type: mimeType }), safeName);
   form.append("model", model);
   form.append("response_format", "json");
   if (stt.language) form.append("language", stt.language);
