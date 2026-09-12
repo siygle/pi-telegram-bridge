@@ -290,6 +290,26 @@ function telegramSourceLabel(ctx: any): string {
   return `[📱 ${scope} ${chatId} @${username} via telegram]`;
 }
 
+function formatBytes(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes)) return "unknown size";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)}${units[unit]}`;
+}
+
+function telegramDownloadLimitHint(fileSize?: number): string {
+  const size = formatBytes(fileSize);
+  const limit = 20 * 1024 * 1024;
+  return fileSize && fileSize > limit
+    ? `Telegram Bot API only allows bots to download files up to 20MB; this file is ${size}. Please send a download link instead.`
+    : `Telegram did not provide a downloadable file path (${size}). Please try again or send a download link.`;
+}
+
 function ensureAuthConfig(config: BridgeConfig): AuthConfig {
   if (!config.auth) config.auth = {};
   if (!config.auth.trustedUsers) config.auth.trustedUsers = [];
@@ -928,7 +948,7 @@ export default function (pi: ExtensionAPI) {
         content = "[image]";
       } else if ((reply as any).document) {
         const doc = (reply as any).document;
-        content = `[file: ${doc.file_name || "unnamed"}]`;
+        content = `[file: ${doc.file_name || "unnamed"}, ${formatBytes(doc.file_size)} — reply context only, file was not downloaded]`;
       } else if ((reply as any).voice) {
         content = `[voice, ${(reply as any).voice.duration || 0}s]`;
       } else if ((reply as any).audio) {
@@ -986,59 +1006,75 @@ export default function (pi: ExtensionAPI) {
       const doc = ctx.message.document;
       if (!doc) return;
 
-      const file = await ctx.api.getFile(doc.file_id);
-      if (!file.file_path) {
-        await ctx.reply("❌ Could not download file.");
-        return;
-      }
+      try {
+        const file = await ctx.api.getFile(doc.file_id);
+        if (!file.file_path) {
+          const hint = telegramDownloadLimitHint(doc.file_size);
+          await ctx.reply(`❌ Could not download file: ${hint}`);
+          dbg("document:no-file-path", { name: doc.file_name, size: doc.file_size, mime: doc.mime_type, hint });
+          return;
+        }
 
-      // Download file to temp directory
-      const url = `https://api.telegram.org/file/bot${config.telegram!.token}/${file.file_path}`;
-      const response = await fetch(url);
-      const buffer = Buffer.from(await response.arrayBuffer());
+        // Download file to temp directory
+        const url = `https://api.telegram.org/file/bot${config.telegram!.token}/${file.file_path}`;
+        const response = await fetch(url);
+        if (!response.ok) {
+          const body = await response.text().catch(() => "");
+          const hint = telegramDownloadLimitHint(doc.file_size);
+          await ctx.reply(`❌ Could not download file (${response.status}): ${hint}`);
+          dbg("document:download-failed", { name: doc.file_name, size: doc.file_size, mime: doc.mime_type, status: response.status, body: body.slice(0, 300), hint });
+          return;
+        }
+        const buffer = Buffer.from(await response.arrayBuffer());
 
-      // Save with original filename, prefixed to avoid collisions
-      const sanitizedName = (doc.file_name || "unnamed").replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, "_");
-      const timestamp = Date.now();
-      const uploadDir = path.join(os.tmpdir(), "pi-telegram-uploads");
-      if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
-      }
-      const filePath = path.join(uploadDir, `${timestamp}-${sanitizedName}`);
-      fs.writeFileSync(filePath, buffer);
+        // Save with original filename, prefixed to avoid collisions
+        const sanitizedName = (doc.file_name || "unnamed").replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, "_");
+        const timestamp = Date.now();
+        const uploadDir = path.join(os.tmpdir(), "pi-telegram-uploads");
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        const filePath = path.join(uploadDir, `${timestamp}-${sanitizedName}`);
+        fs.writeFileSync(filePath, buffer);
 
-      const source = telegramSourceLabel(ctx);
-      const caption = ctx.message.caption || "";
-      const fileSize = doc.file_size ? `${(doc.file_size / 1024).toFixed(1)}KB` : "unknown size";
+        const source = telegramSourceLabel(ctx);
+        const caption = ctx.message.caption || "";
+        const fileSize = formatBytes(doc.file_size || buffer.length);
 
-      // Check if it's an image type that wasn't sent as photo (e.g., sent as file)
-      const mimeType = doc.mime_type || "";
-      const isImage = mimeType.startsWith("image/");
+        // Check if it's an image type that wasn't sent as photo (e.g., sent as file)
+        const mimeType = doc.mime_type || "";
+        const isImage = mimeType.startsWith("image/");
 
-      const replyContext = await extractReplyContext(ctx);
+        const replyContext = await extractReplyContext(ctx);
 
-      if (isImage) {
-        // Send as image so LLM can see it
-        const base64 = buffer.toString("base64");
-        const imgMime = (mimeType || "image/png") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+        if (isImage) {
+          // Send as image so LLM can see it
+          const base64 = buffer.toString("base64");
+          const imgMime = (mimeType || "image/png") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
 
-        const textParts = [
-          replyContext,
-          `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
-        ].filter(Boolean).join("\n\n");
+          const textParts = [
+            replyContext,
+            `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+          ].filter(Boolean).join("\n\n");
 
-        await enqueueTelegramJob(ctx, makeJob(ctx, "message", [
-          { type: "text" as const, text: textParts },
-          { type: "image" as const, mimeType: imgMime, data: base64 },
-        ]));
-      } else {
-        // Non-image file: send as text with file path
-        const textParts = [
-          replyContext,
-          `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
-        ].filter(Boolean).join("\n\n");
+          await enqueueTelegramJob(ctx, makeJob(ctx, "message", [
+            { type: "text" as const, text: textParts },
+            { type: "image" as const, mimeType: imgMime, data: base64 },
+          ]));
+        } else {
+          // Non-image file: send as text with file path
+          const textParts = [
+            replyContext,
+            `${source}[📎 file: ${filePath} (${doc.file_name}, ${fileSize})]: ${caption || doc.file_name}`,
+          ].filter(Boolean).join("\n\n");
 
-        await enqueueTelegramJob(ctx, makeJob(ctx, "message", textParts));
+          await enqueueTelegramJob(ctx, makeJob(ctx, "message", textParts));
+        }
+      } catch (error: any) {
+        const message = error?.description || error?.message || String(error);
+        const hint = telegramDownloadLimitHint(doc.file_size);
+        await ctx.reply(`❌ Could not download file: ${message}\n${hint}`);
+        dbg("document:error", { name: doc.file_name, size: doc.file_size, mime: doc.mime_type, error: message, hint });
       }
     });
 
