@@ -82,11 +82,22 @@ Config is stored in `~/.pi/telegram-bridge.json`:
 | `auth.trustedChats` | `PI_TELEGRAM_TRUSTED_CHATS` | Comma-separated Telegram chat/group IDs. Private chats from trusted users are allowed automatically; group chats must be trusted explicitly. |
 | `auth.chatSessions` | — | Internal per-chat session-file mapping used to isolate private and family-group conversation history. |
 | `autoConnect` | `PI_TELEGRAM_AUTO_CONNECT` | Auto-connect on pi startup |
+| `autoConnectSkipEnv` | `PI_TELEGRAM_AUTO_CONNECT_SKIP_ENV` | Environment variable names (comma-separated in env); autoConnect is skipped when any of them is set. `PI_TELEGRAM_AUTO_CONNECT=true` overrides it. |
 | `stt.provider` | `PI_TELEGRAM_STT_PROVIDER` | `groq` (default), `openai`, or `none` |
 | `stt.apiKey` | `PI_TELEGRAM_STT_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` | API key for the STT provider |
 | `stt.model` | `PI_TELEGRAM_STT_MODEL` | Default: `whisper-large-v3-turbo` (Groq) / `whisper-1` (OpenAI) |
 | `stt.language` | `PI_TELEGRAM_STT_LANGUAGE` | Optional ISO-639-1 hint (e.g. `zh`, `en`) |
 | `stt.baseUrl` | — | Override API base URL (for self-hosted/compatible endpoints) |
+
+### Skipping autoConnect in managed sessions
+
+The extension is loaded by every pi on the machine. When some of them are launched by another system (an orchestrator, a supervisor, a CI runner) that already talks to the user, they should not connect the bot: the polling lock prevents double polling, but whichever pi starts next takes the bot over when the lock holder exits. List an environment variable that only those launches set:
+
+```json
+{ "autoConnect": true, "autoConnectSkipEnv": ["MY_ORCHESTRATOR_SESSION_ID"] }
+```
+
+A pi with that variable set skips autoConnect; `/tg connect` still connects manually.
 
 ### Voice transcription
 

@@ -33,6 +33,8 @@ interface BridgeConfig {
   telegram?: TelegramConfig;
   auth?: AuthConfig;
   autoConnect?: boolean;
+  /** Skip autoConnect when any of these environment variables is set (non-empty). */
+  autoConnectSkipEnv?: string[];
   stt?: STTConfig;
 }
 
@@ -154,6 +156,11 @@ function loadConfig(): BridgeConfig {
   }
   if (process.env.PI_TELEGRAM_AUTO_CONNECT !== undefined) {
     config.autoConnect = process.env.PI_TELEGRAM_AUTO_CONNECT === "true";
+  }
+  if (process.env.PI_TELEGRAM_AUTO_CONNECT_SKIP_ENV !== undefined) {
+    config.autoConnectSkipEnv = process.env.PI_TELEGRAM_AUTO_CONNECT_SKIP_ENV.split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
   }
 
   // STT env overrides (GROQ_API_KEY is a common convention)
@@ -415,6 +422,15 @@ function acquireLock(): boolean {
   }
   fs.writeFileSync(LOCK_PATH, myPid.toString(), { mode: 0o600 });
   return true;
+}
+
+// Name of the autoConnectSkipEnv variable that is set in this process, or null.
+// A pi launched by a supervisor or orchestrator usually reaches its user through
+// that system, so it should not take the bot over when the pi holding the
+// polling lock exits. PI_TELEGRAM_AUTO_CONNECT=true still forces autoConnect.
+function autoConnectSkippedBy(config: BridgeConfig, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (env.PI_TELEGRAM_AUTO_CONNECT === "true") return null;
+  return (config.autoConnectSkipEnv ?? []).find((name) => !!env[name]) ?? null;
 }
 
 function releaseLock(): void {
@@ -1473,6 +1489,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (config.autoConnect && config.telegram?.token) {
+      const skipVar = autoConnectSkippedBy(config);
+      if (skipVar) {
+        ctx.ui.notify(`Telegram autoConnect skipped: ${skipVar} is set (use /tg connect to connect manually)`, "info");
+        return;
+      }
       await connectBot();
     }
   });
